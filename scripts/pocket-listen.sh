@@ -12,4 +12,4 @@ die() { printf 'Pocket listener: %s\n' "$*" >&2; exit 1; }
 
 printf 'Listening on TCP port %s. Press Ctrl+C to stop.\n' "$PORT"
 printf 'Anyone who can reach this port may exchange plain text. Do not send secrets.\n'
-exec "$NC_BIN" --listen --verbose --port "$PORT"
+exec "$NC_BIN" --listen --verbose "$PORT"
