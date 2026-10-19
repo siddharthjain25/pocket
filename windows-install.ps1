@@ -12,6 +12,10 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$ListenerHostPublicKey,
 
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$EnrollmentToken,
+    
     [ValidatePattern('^[a-zA-Z0-9._-]{1,64}$')]
     [string]$AgentName = $env:COMPUTERNAME,
 
