@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # Pocket Key Linux installer. This script is downloaded and run by the ESP32 HID launcher.
 set -Eeuo pipefail
@@ -6,11 +7,14 @@ fail() { printf '\n[POCKET INSTALL] ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[POCKET INSTALL] %s\n' "$*"; }
 
 [[ "$(uname -s)" == Linux ]] || fail "This installer currently supports Linux only. Windows agent is not included."
+
 for v in POCKET_PI POCKET_ENROLLMENT_TOKEN POCKET_LISTENER_HOST_PUBLIC_KEY POCKET_AGENT_BINARY_URL_AMD64 POCKET_AGENT_BINARY_URL_ARM64; do
   [[ -n "${!v:-}" ]] || fail "$v is not configured in the ESP32 sketch."
 done
+
 [[ "$POCKET_ENROLLMENT_TOKEN" != CHANGE_ME* ]] || fail "Set a strong POCKET_ENROLLMENT_TOKEN first."
 [[ "$POCKET_LISTENER_HOST_PUBLIC_KEY" == ssh-* ]] || fail "POCKET_LISTENER_HOST_PUBLIC_KEY must be the listener's verified public host-key line."
+
 command -v curl >/dev/null 2>&1 || fail "curl is required. Install curl and retry."
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required for automatic user-service startup."
 
@@ -34,11 +38,14 @@ esac
 log "Downloading the configured Linux agent binary for $(uname -m)..."
 TMP_BIN="$(mktemp)"
 trap 'rm -f "$TMP_BIN"' EXIT
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$AGENT_URL" -o "$TMP_BIN" || fail "Could not download the agent binary. Publish the rebuilt Linux agent at the configured URL."
+
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$AGENT_URL" -o "$TMP_BIN" \
+  || fail "Could not download the agent binary. Publish the rebuilt Linux agent at the configured URL."
+
 file "$TMP_BIN" >/dev/null 2>&1 || true
 install -m 700 "$TMP_BIN" "$BIN_PATH"
 
-# The public host key is pinned locally; SSH host verification is never disabled.
+# Pin the listener host key locally. SSH host verification is never disabled.
 printf '%s\n' "$POCKET_LISTENER_HOST_PUBLIC_KEY" > "$HOST_KEY_PATH"
 chmod 600 "$HOST_KEY_PATH"
 
@@ -49,7 +56,8 @@ export POCKET_PI
 export POCKET_ENROLLMENT_TOKEN
 
 log "Generating a unique private key on this computer and enrolling its public key with the Pi..."
-"$BIN_PATH" --enroll-only || fail "Enrollment failed. Check the Pi address, pinned host key, enrollment token, and listener logs."
+"$BIN_PATH" --enroll-only \
+  || fail "Enrollment failed. Check the Pi address, pinned host key, enrollment token, and listener logs."
 
 cat > "$UNIT_PATH" <<EOF
 [Unit]
@@ -65,16 +73,23 @@ Environment=POCKET_LISTENER_HOST_PUBLIC_KEY=$HOST_KEY_PATH
 ExecStart=$BIN_PATH
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
+
+# Allow required privilege-gaining mechanisms in agent child processes.
+# This does not grant root privileges by itself.
+NoNewPrivileges=false
 
 [Install]
 WantedBy=default.target
 EOF
+
 chmod 600 "$UNIT_PATH"
 
 log "Enabling the agent user service..."
-systemctl --user daemon-reload || fail "Could not reload the user systemd manager."
-systemctl --user enable --now pocket-agent.service || fail "Could not start the service. Check 'journalctl --user -u pocket-agent.service'."
+systemctl --user daemon-reload \
+  || fail "Could not reload the user systemd manager."
+
+systemctl --user enable --now pocket-agent.service \
+  || fail "Could not start the service. Check 'journalctl --user -u pocket-agent.service'."
 
 log "Installed and enrolled. The private key remains on this computer."
 log "Service status: systemctl --user status pocket-agent.service"
