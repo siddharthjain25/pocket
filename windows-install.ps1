@@ -1,4 +1,3 @@
-```powershell
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -259,4 +258,3 @@ Write-Host 'Pocket Agent installation completed.' -ForegroundColor Green
 Write-Host "Install directory: $AppDir"
 Write-Host "Scheduled task:    $TaskName"
 Write-Host ''
-```
