@@ -29,16 +29,19 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # ---------------------------------------------------------------------------
 
-$AppDir       = Join-Path $env:LOCALAPPDATA 'PocketAgent'
-$AgentExe     = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
-$AgentKey     = Join-Path $AppDir 'agent_ed25519'
-$HostKeyFile  = Join-Path $AppDir 'listener_host_key.pub'
-$LauncherFile = Join-Path $AppDir 'run-agent.ps1'
-$LogFile      = Join-Path $AppDir 'agent.log'
-$TaskName     = 'PocketAgent'
+$AppDir          = Join-Path $env:LOCALAPPDATA 'PocketAgent'
+$AgentExe        = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
+$AgentKey        = Join-Path $AppDir 'agent_ed25519'
+$HostKeyFile     = Join-Path $AppDir 'listener_host_key.pub'
+$LauncherFile    = Join-Path $AppDir 'run-agent.ps1'
+$VbsLauncherFile = Join-Path $AppDir 'run-agent-hidden.vbs'
+$LogFile         = Join-Path $AppDir 'agent.log'
+$TaskName        = 'PocketAgent'
 
 $PowerShellExe = Join-Path $env:SystemRoot `
     'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+$WScriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
 
 # ---------------------------------------------------------------------------
 # Validate configuration
@@ -65,6 +68,23 @@ Write-Host "Install directory: $AppDir"
 Write-Host "Agent name:        $AgentName"
 Write-Host "Shell:             $Shell"
 Write-Host ''
+
+# ---------------------------------------------------------------------------
+# Stop the existing task before updating its files
+# ---------------------------------------------------------------------------
+
+$ExistingTask = Get-ScheduledTask `
+    -TaskName $TaskName `
+    -ErrorAction SilentlyContinue
+
+if ($null -ne $ExistingTask) {
+    Write-Host 'Stopping existing Pocket Agent task...' -ForegroundColor Yellow
+
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+
+    # Allow the launcher a moment to stop before replacing the executable.
+    Start-Sleep -Seconds 2
+}
 
 # ---------------------------------------------------------------------------
 # Create installation directory and restrict permissions
@@ -122,7 +142,7 @@ Set-Content `
     -Encoding ascii
 
 # ---------------------------------------------------------------------------
-# Configure environment for enrollment
+# Enroll agent
 # ---------------------------------------------------------------------------
 
 $env:POCKET_PI = $Pi
@@ -131,10 +151,6 @@ $env:POCKET_AGENT_NAME = $AgentName
 $env:POCKET_AGENT_KEY = $AgentKey
 $env:POCKET_LISTENER_HOST_PUBLIC_KEY = $HostKeyFile
 $env:POCKET_ENROLLMENT_TOKEN = $EnrollmentToken
-
-# ---------------------------------------------------------------------------
-# Enroll agent
-# ---------------------------------------------------------------------------
 
 try {
     Write-Host ''
@@ -158,7 +174,7 @@ finally {
 }
 
 # ---------------------------------------------------------------------------
-# Create hidden background launcher with logging and reconnect retries
+# Create persistent background PowerShell launcher
 # ---------------------------------------------------------------------------
 
 $LauncherTemplate = @'
@@ -200,7 +216,8 @@ while ($true) {
             -host $env:POCKET_AGENT_NAME *>> $LogFile
 
         $ExitCode = $LASTEXITCODE
-        Write-AgentLog "Agent exited with code $ExitCode. Restarting in 5 seconds."
+
+        Write-AgentLog "Agent exited with code $ExitCode. Retrying in 5 seconds."
     }
     catch {
         Write-AgentLog ("ERROR: " + $_.Exception.Message)
@@ -211,7 +228,6 @@ while ($true) {
 }
 '@
 
-# Escape single quotes for PowerShell single-quoted string literals.
 $SafePi = $Pi.Replace("'", "''")
 $SafeShell = $Shell.Replace("'", "''")
 $SafeAgentName = $AgentName.Replace("'", "''")
@@ -229,15 +245,40 @@ Set-Content `
     -Encoding UTF8
 
 # ---------------------------------------------------------------------------
-# Register background task at user logon
+# Create VBScript wrapper to hide the PowerShell console completely
+# ---------------------------------------------------------------------------
+
+$VbsContent = @'
+Set WshShell = CreateObject("WScript.Shell")
+Set FSO = CreateObject("Scripting.FileSystemObject")
+
+AppDir = FSO.GetParentFolderName(WScript.ScriptFullName)
+Launcher = FSO.BuildPath(AppDir, "run-agent.ps1")
+
+PowerShell = WshShell.ExpandEnvironmentStrings("%SystemRoot%") & _
+    "\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+Command = """" & PowerShell & """ -NoLogo -NoProfile -NonInteractive" & _
+    " -ExecutionPolicy Bypass -File """ & Launcher & """"
+
+WshShell.Run Command, 0, False
+'@
+
+Set-Content `
+    -LiteralPath $VbsLauncherFile `
+    -Value $VbsContent `
+    -Encoding ASCII
+
+# ---------------------------------------------------------------------------
+# Register scheduled task using wscript.exe (no visible console)
 # ---------------------------------------------------------------------------
 
 Write-Host ''
-Write-Host 'Registering background scheduled task...' -ForegroundColor Cyan
+Write-Host 'Registering hidden background task...' -ForegroundColor Cyan
 
 $Action = New-ScheduledTaskAction `
-    -Execute $PowerShellExe `
-    -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LauncherFile`""
+    -Execute $WScriptExe `
+    -Argument "`"$VbsLauncherFile`""
 
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
 
@@ -259,17 +300,17 @@ $Task = New-ScheduledTask `
     -Trigger $Trigger `
     -Principal $Principal `
     -Settings $Settings `
-    -Description 'Runs Pocket Agent in the background at user logon.'
+    -Description 'Runs Pocket Agent invisibly in the background at user logon.'
 
 Register-ScheduledTask `
     -TaskName $TaskName `
     -InputObject $Task `
     -Force | Out-Null
 
-Write-Host 'Background task registered.' -ForegroundColor Green
+Write-Host 'Hidden background task registered.' -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# Start the agent now
+# Start the task now
 # ---------------------------------------------------------------------------
 
 Start-ScheduledTask -TaskName $TaskName
@@ -280,5 +321,5 @@ Write-Host "Install directory: $AppDir"
 Write-Host "Scheduled task:    $TaskName"
 Write-Host "Agent log:         $LogFile"
 Write-Host ''
-Write-Host 'The agent runs hidden and starts again at user logon.'
+Write-Host 'The agent runs without a visible console and starts at user logon.'
 Write-Host ''
