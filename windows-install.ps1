@@ -49,7 +49,7 @@ $HostKeyPath = Join-Path $AppDir 'listener_host_key.pub'
 $RunnerPath = Join-Path $AppDir 'run-agent.ps1'
 $TaskName = 'PocketAgent'
 
-# Create the installation directory
+# Create installation directory
 New-Item -ItemType Directory -Path $AppDir -Force | Out-Null
 
 # Restrict directory access to the current user and SYSTEM
@@ -91,7 +91,7 @@ Set-Content `
     -Value $ListenerHostPublicKey `
     -Encoding ascii
 
-# Configure the enrollment process
+# Configure enrollment environment
 $env:POCKET_PI = $Pi
 $env:POCKET_SHELL = $Shell
 $env:POCKET_AGENT_NAME = $AgentName
@@ -102,7 +102,6 @@ $env:POCKET_ENROLLMENT_TOKEN = $EnrollmentToken
 try {
     Write-Host 'Enrolling Pocket Agent...' -ForegroundColor Cyan
 
-    # Enroll and generate/store the agent key as implemented by the Go agent
     & $AgentExe `
         -pi $Pi `
         -shell $Shell `
@@ -112,11 +111,18 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Agent enrollment failed with exit code $LASTEXITCODE."
     }
+
+    Write-Host 'Agent enrollment succeeded.' -ForegroundColor Green
 }
 finally {
-    # Do not persist the enrollment token in the launcher or task
+    # Clear the process environment variable.
+    # Do not assign to the validated EnrollmentToken parameter.
     $env:POCKET_ENROLLMENT_TOKEN = $null
-    $EnrollmentToken = $null
+}
+
+# Safely quote values for the persistent PowerShell launcher
+function ConvertTo-PowerShellLiteral([string]$Value) {
+    return "'" + $Value.Replace("'", "''") + "'"
 }
 
 # Generate the persistent launcher without the enrollment token
@@ -138,11 +144,6 @@ $AgentExe = __AGENT_EXE__
 
 exit $LASTEXITCODE
 '@
-
-# Safely quote values embedded in the PowerShell launcher
-function ConvertTo-PowerShellLiteral([string]$Value) {
-    return "'" + $Value.Replace("'", "''") + "'"
-}
 
 $Runner = $Runner.Replace('__PI__', (ConvertTo-PowerShellLiteral $Pi))
 $Runner = $Runner.Replace('__SHELL__', (ConvertTo-PowerShellLiteral $Shell))
