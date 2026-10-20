@@ -1,3 +1,4 @@
+```powershell
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -25,7 +26,21 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+$AppDir       = Join-Path $env:LOCALAPPDATA 'PocketAgent'
+$AgentExe     = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
+$AgentKey     = Join-Path $AppDir 'agent_ed25519'
+$HostKeyFile  = Join-Path $AppDir 'listener_host_key.pub'
+$LauncherFile = Join-Path $AppDir 'run-agent.ps1'
+$TaskName     = 'PocketAgent'
+
+# ---------------------------------------------------------------------------
 # Validate inputs
+# ---------------------------------------------------------------------------
+
 if (-not $AgentUrl.StartsWith(
     'https://',
     [System.StringComparison]::OrdinalIgnoreCase
@@ -33,73 +48,93 @@ if (-not $AgentUrl.StartsWith(
     throw 'AgentUrl must use HTTPS.'
 }
 
-if ($ListenerHostPublicKey -notmatch '^ssh-ed25519\s+[A-Za-z0-9+/]+={0,3}(\s+.*)?$') {
-    throw 'ListenerHostPublicKey is not a valid ssh-ed25519 public key line.'
+if ($ListenerHostPublicKey -notmatch '^ssh-ed25519\s+\S+') {
+    throw 'ListenerHostPublicKey must be an ssh-ed25519 public host key.'
 }
 
-if ([string]::IsNullOrWhiteSpace($EnrollmentToken)) {
-    throw 'EnrollmentToken cannot be empty.'
+if ([string]::IsNullOrWhiteSpace($AgentName)) {
+    throw 'AgentName cannot be empty.'
 }
 
-# Installation paths
-$AppDir = Join-Path $env:LOCALAPPDATA 'PocketAgent'
-$AgentExe = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
-$KeyPath = Join-Path $AppDir 'agent_ed25519'
-$HostKeyPath = Join-Path $AppDir 'listener_host_key.pub'
-$RunnerPath = Join-Path $AppDir 'run-agent.ps1'
-$TaskName = 'PocketAgent'
+Write-Host ''
+Write-Host 'Installing Pocket Agent...' -ForegroundColor Cyan
+Write-Host "Install directory: $AppDir"
+Write-Host "Agent name:        $AgentName"
+Write-Host "Shell:             $Shell"
+Write-Host ''
 
-# Create installation directory
+# ---------------------------------------------------------------------------
+# Create installation directory and restrict permissions
+# ---------------------------------------------------------------------------
+
 New-Item -ItemType Directory -Path $AppDir -Force | Out-Null
 
-# Restrict directory access to the current user and SYSTEM
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
-& icacls.exe $AppDir /inheritance:r /grant:r `
-    "${CurrentUser}:(OI)(CI)F" `
-    '*S-1-5-18:(OI)(CI)F' | Out-Null
+& icacls.exe $AppDir /inheritance:r `
+    /grant:r "${CurrentUser}:(OI)(CI)F" `
+    '*S-1-5-18:(OI)(CI)F' | Out-Host
 
 if ($LASTEXITCODE -ne 0) {
-    throw 'Failed to set installation directory permissions.'
+    throw 'Failed to configure permissions on the Pocket Agent directory.'
 }
 
-# Download the Windows agent executable
-$DownloadPath = Join-Path $env:TEMP (
+# ---------------------------------------------------------------------------
+# Download agent
+# ---------------------------------------------------------------------------
+
+$TempExe = Join-Path $env:TEMP (
     'pocket-agent-' + [guid]::NewGuid().ToString('N') + '.exe'
 )
 
 try {
-    Invoke-WebRequest `
-        -UseBasicParsing `
-        -Uri $AgentUrl `
-        -OutFile $DownloadPath
+    Write-Host 'Downloading Pocket Agent...' -ForegroundColor Cyan
 
-    if (-not (Test-Path $DownloadPath) -or
-        (Get-Item $DownloadPath).Length -eq 0) {
-        throw 'The downloaded agent executable is missing or empty.'
+    Invoke-WebRequest `
+        -Uri $AgentUrl `
+        -OutFile $TempExe `
+        -UseBasicParsing
+
+    if (-not (Test-Path -LiteralPath $TempExe)) {
+        throw 'Agent download failed: downloaded file was not found.'
     }
 
-    Move-Item -Path $DownloadPath -Destination $AgentExe -Force
+    if ((Get-Item -LiteralPath $TempExe).Length -eq 0) {
+        throw 'Agent download failed: downloaded file is empty.'
+    }
+
+    Move-Item -LiteralPath $TempExe -Destination $AgentExe -Force
 }
 finally {
-    Remove-Item $DownloadPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $TempExe -Force -ErrorAction SilentlyContinue
 }
 
-# Save the pinned SSH listener host key
+# ---------------------------------------------------------------------------
+# Save pinned listener host key
+# ---------------------------------------------------------------------------
+
 Set-Content `
-    -Path $HostKeyPath `
-    -Value $ListenerHostPublicKey `
+    -LiteralPath $HostKeyFile `
+    -Value $ListenerHostPublicKey.Trim() `
     -Encoding ascii
 
-# Configure enrollment environment
+# ---------------------------------------------------------------------------
+# Configure agent environment for enrollment
+# ---------------------------------------------------------------------------
+
 $env:POCKET_PI = $Pi
 $env:POCKET_SHELL = $Shell
 $env:POCKET_AGENT_NAME = $AgentName
-$env:POCKET_AGENT_KEY = $KeyPath
-$env:POCKET_LISTENER_HOST_PUBLIC_KEY = $HostKeyPath
+$env:POCKET_AGENT_KEY = $AgentKey
+$env:POCKET_LISTENER_HOST_PUBLIC_KEY = $HostKeyFile
 $env:POCKET_ENROLLMENT_TOKEN = $EnrollmentToken
 
+# ---------------------------------------------------------------------------
+# Enroll agent
+# ---------------------------------------------------------------------------
+
 try {
+    Write-Host ''
     Write-Host 'Enrolling Pocket Agent...' -ForegroundColor Cyan
 
     & $AgentExe `
@@ -112,55 +147,82 @@ try {
         throw "Agent enrollment failed with exit code $LASTEXITCODE."
     }
 
-    Write-Host 'Agent enrollment succeeded.' -ForegroundColor Green
+    Write-Host 'Agent enrolled successfully.' -ForegroundColor Green
 }
 finally {
-    # Clear the process environment variable.
-    # Do not assign to the validated EnrollmentToken parameter.
-    $env:POCKET_ENROLLMENT_TOKEN = $null
+    # IMPORTANT:
+    # Do not assign to $EnrollmentToken. It is a validated parameter,
+    # and assigning $null or an empty string causes a validation error.
+    Remove-Item Env:POCKET_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
 }
 
-# Safely quote values for the persistent PowerShell launcher
-function ConvertTo-PowerShellLiteral([string]$Value) {
-    return "'" + $Value.Replace("'", "''") + "'"
-}
+# ---------------------------------------------------------------------------
+# Create persistent launcher
+# ---------------------------------------------------------------------------
 
-# Generate the persistent launcher without the enrollment token
-$Runner = @'
+$LauncherContent = @'
 $ErrorActionPreference = 'Stop'
 
-$env:POCKET_PI = __PI__
-$env:POCKET_SHELL = __SHELL__
-$env:POCKET_AGENT_NAME = __AGENT_NAME__
-$env:POCKET_AGENT_KEY = __KEY_PATH__
-$env:POCKET_LISTENER_HOST_PUBLIC_KEY = __HOST_KEY_PATH__
+$AppDir = Join-Path $env:LOCALAPPDATA 'PocketAgent'
+$AgentExe = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
+$AgentKey = Join-Path $AppDir 'agent_ed25519'
+$HostKeyFile = Join-Path $AppDir 'listener_host_key.pub'
 
-$AgentExe = __AGENT_EXE__
+$env:POCKET_PI = '__POCKET_PI__'
+$env:POCKET_SHELL = '__POCKET_SHELL__'
+$env:POCKET_AGENT_NAME = '__POCKET_AGENT_NAME__'
+$env:POCKET_AGENT_KEY = $AgentKey
+$env:POCKET_LISTENER_HOST_PUBLIC_KEY = $HostKeyFile
 
-& $AgentExe `
-    -pi $env:POCKET_PI `
-    -shell $env:POCKET_SHELL `
-    -host $env:POCKET_AGENT_NAME
+if (-not (Test-Path -LiteralPath $AgentExe)) {
+    throw "Pocket Agent executable not found: $AgentExe"
+}
 
-exit $LASTEXITCODE
+while ($true) {
+    & $AgentExe `
+        -pi $env:POCKET_PI `
+        -shell $env:POCKET_SHELL `
+        -host $env:POCKET_AGENT_NAME
+
+    $ExitCode = $LASTEXITCODE
+
+    # Retry after a short delay if the agent disconnects or exits.
+    Start-Sleep -Seconds 5
+}
 '@
 
-$Runner = $Runner.Replace('__PI__', (ConvertTo-PowerShellLiteral $Pi))
-$Runner = $Runner.Replace('__SHELL__', (ConvertTo-PowerShellLiteral $Shell))
-$Runner = $Runner.Replace('__AGENT_NAME__', (ConvertTo-PowerShellLiteral $AgentName))
-$Runner = $Runner.Replace('__KEY_PATH__', (ConvertTo-PowerShellLiteral $KeyPath))
-$Runner = $Runner.Replace('__HOST_KEY_PATH__', (ConvertTo-PowerShellLiteral $HostKeyPath))
-$Runner = $Runner.Replace('__AGENT_EXE__', (ConvertTo-PowerShellLiteral $AgentExe))
+# Safely substitute configuration values in the launcher template.
+$LauncherContent = $LauncherContent.Replace(
+    '__POCKET_PI__',
+    $Pi.Replace("'", "''")
+)
+$LauncherContent = $LauncherContent.Replace(
+    '__POCKET_SHELL__',
+    $Shell.Replace("'", "''")
+)
+$LauncherContent = $LauncherContent.Replace(
+    '__POCKET_AGENT_NAME__',
+    $AgentName.Replace("'", "''")
+)
 
-Set-Content -Path $RunnerPath -Value $Runner -Encoding utf8
+Set-Content `
+    -LiteralPath $LauncherFile `
+    -Value $LauncherContent `
+    -Encoding utf8
 
-# Register a current-user scheduled task to start the agent at logon
-$PowerShellExe = Join-Path $PSHOME 'powershell.exe'
+# ---------------------------------------------------------------------------
+# Register scheduled task
+# ---------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host 'Registering Pocket Agent scheduled task...' -ForegroundColor Cyan
+
+$PowerShellExe = Join-Path $env:SystemRoot `
+    'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 $Action = New-ScheduledTaskAction `
     -Execute $PowerShellExe `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$RunnerPath`"" `
-    -WorkingDirectory $AppDir
+    -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LauncherFile`""
 
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
 
@@ -171,21 +233,30 @@ $Principal = New-ScheduledTaskPrincipal `
 
 $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Days 0)
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
+$Task = New-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Principal $Principal `
     -Settings $Settings `
-    -Description 'Starts the Pocket Agent at user logon.' `
+    -Description 'Starts the Pocket Agent at user logon.'
+
+Register-ScheduledTask `
+    -TaskName $TaskName `
+    -InputObject $Task `
     -Force | Out-Null
 
+Write-Host 'Scheduled task registered successfully.' -ForegroundColor Green
+
+# Start it now, too.
 Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ''
-Write-Host 'Pocket Agent installation and enrollment completed.' -ForegroundColor Green
+Write-Host 'Pocket Agent installation completed.' -ForegroundColor Green
 Write-Host "Install directory: $AppDir"
 Write-Host "Scheduled task:    $TaskName"
-Write-Host 'The agent will start at the next user logon.'
+Write-Host ''
+```
