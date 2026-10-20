@@ -34,10 +34,14 @@ $AgentExe     = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
 $AgentKey     = Join-Path $AppDir 'agent_ed25519'
 $HostKeyFile  = Join-Path $AppDir 'listener_host_key.pub'
 $LauncherFile = Join-Path $AppDir 'run-agent.ps1'
+$LogFile      = Join-Path $AppDir 'agent.log'
 $TaskName     = 'PocketAgent'
 
+$PowerShellExe = Join-Path $env:SystemRoot `
+    'System32\WindowsPowerShell\v1.0\powershell.exe'
+
 # ---------------------------------------------------------------------------
-# Validate inputs
+# Validate configuration
 # ---------------------------------------------------------------------------
 
 if (-not $AgentUrl.StartsWith(
@@ -79,7 +83,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ---------------------------------------------------------------------------
-# Download agent
+# Download agent executable
 # ---------------------------------------------------------------------------
 
 $TempExe = Join-Path $env:TEMP (
@@ -95,7 +99,7 @@ try {
         -UseBasicParsing
 
     if (-not (Test-Path -LiteralPath $TempExe)) {
-        throw 'Agent download failed: downloaded file was not found.'
+        throw 'Agent download failed: file was not found.'
     }
 
     if ((Get-Item -LiteralPath $TempExe).Length -eq 0) {
@@ -118,7 +122,7 @@ Set-Content `
     -Encoding ascii
 
 # ---------------------------------------------------------------------------
-# Configure agent environment for enrollment
+# Configure environment for enrollment
 # ---------------------------------------------------------------------------
 
 $env:POCKET_PI = $Pi
@@ -149,23 +153,22 @@ try {
     Write-Host 'Agent enrolled successfully.' -ForegroundColor Green
 }
 finally {
-    # IMPORTANT:
-    # Do not assign to $EnrollmentToken. It is a validated parameter,
-    # and assigning $null or an empty string causes a validation error.
+    # Do not assign to the validated EnrollmentToken parameter.
     Remove-Item Env:POCKET_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
-# Create persistent launcher
+# Create hidden background launcher with logging and reconnect retries
 # ---------------------------------------------------------------------------
 
-$LauncherContent = @'
-$ErrorActionPreference = 'Stop'
+$LauncherTemplate = @'
+$ErrorActionPreference = 'Continue'
 
 $AppDir = Join-Path $env:LOCALAPPDATA 'PocketAgent'
 $AgentExe = Join-Path $AppDir 'pocket-agent-windows-amd64.exe'
 $AgentKey = Join-Path $AppDir 'agent_ed25519'
 $HostKeyFile = Join-Path $AppDir 'listener_host_key.pub'
+$LogFile = Join-Path $AppDir 'agent.log'
 
 $env:POCKET_PI = '__POCKET_PI__'
 $env:POCKET_SHELL = '__POCKET_SHELL__'
@@ -173,51 +176,64 @@ $env:POCKET_AGENT_NAME = '__POCKET_AGENT_NAME__'
 $env:POCKET_AGENT_KEY = $AgentKey
 $env:POCKET_LISTENER_HOST_PUBLIC_KEY = $HostKeyFile
 
+function Write-AgentLog {
+    param([string]$Message)
+
+    $Line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    Add-Content -LiteralPath $LogFile -Value $Line -Encoding UTF8
+}
+
+Write-AgentLog 'Background launcher started.'
+
 if (-not (Test-Path -LiteralPath $AgentExe)) {
-    throw "Pocket Agent executable not found: $AgentExe"
+    Write-AgentLog "ERROR: Agent executable not found: $AgentExe"
+    exit 1
 }
 
 while ($true) {
-    & $AgentExe `
-        -pi $env:POCKET_PI `
-        -shell $env:POCKET_SHELL `
-        -host $env:POCKET_AGENT_NAME
+    try {
+        Write-AgentLog 'Starting Pocket Agent.'
 
-    $ExitCode = $LASTEXITCODE
+        & $AgentExe `
+            -pi $env:POCKET_PI `
+            -shell $env:POCKET_SHELL `
+            -host $env:POCKET_AGENT_NAME *>> $LogFile
 
-    # Retry after a short delay if the agent disconnects or exits.
+        $ExitCode = $LASTEXITCODE
+        Write-AgentLog "Agent exited with code $ExitCode. Restarting in 5 seconds."
+    }
+    catch {
+        Write-AgentLog ("ERROR: " + $_.Exception.Message)
+        Write-AgentLog 'Retrying in 5 seconds.'
+    }
+
     Start-Sleep -Seconds 5
 }
 '@
 
-# Safely substitute configuration values in the launcher template.
-$LauncherContent = $LauncherContent.Replace(
-    '__POCKET_PI__',
-    $Pi.Replace("'", "''")
-)
-$LauncherContent = $LauncherContent.Replace(
-    '__POCKET_SHELL__',
-    $Shell.Replace("'", "''")
-)
+# Escape single quotes for PowerShell single-quoted string literals.
+$SafePi = $Pi.Replace("'", "''")
+$SafeShell = $Shell.Replace("'", "''")
+$SafeAgentName = $AgentName.Replace("'", "''")
+
+$LauncherContent = $LauncherTemplate.Replace('__POCKET_PI__', $SafePi)
+$LauncherContent = $LauncherContent.Replace('__POCKET_SHELL__', $SafeShell)
 $LauncherContent = $LauncherContent.Replace(
     '__POCKET_AGENT_NAME__',
-    $AgentName.Replace("'", "''")
+    $SafeAgentName
 )
 
 Set-Content `
     -LiteralPath $LauncherFile `
     -Value $LauncherContent `
-    -Encoding utf8
+    -Encoding UTF8
 
 # ---------------------------------------------------------------------------
-# Register scheduled task
+# Register background task at user logon
 # ---------------------------------------------------------------------------
 
 Write-Host ''
-Write-Host 'Registering Pocket Agent scheduled task...' -ForegroundColor Cyan
-
-$PowerShellExe = Join-Path $env:SystemRoot `
-    'System32\WindowsPowerShell\v1.0\powershell.exe'
+Write-Host 'Registering background scheduled task...' -ForegroundColor Cyan
 
 $Action = New-ScheduledTaskAction `
     -Execute $PowerShellExe `
@@ -234,27 +250,35 @@ $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit (New-TimeSpan -Days 0)
+    -ExecutionTimeLimit (New-TimeSpan -Days 0) `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
 
 $Task = New-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Principal $Principal `
     -Settings $Settings `
-    -Description 'Starts the Pocket Agent at user logon.'
+    -Description 'Runs Pocket Agent in the background at user logon.'
 
 Register-ScheduledTask `
     -TaskName $TaskName `
     -InputObject $Task `
     -Force | Out-Null
 
-Write-Host 'Scheduled task registered successfully.' -ForegroundColor Green
+Write-Host 'Background task registered.' -ForegroundColor Green
 
-# Start it now, too.
+# ---------------------------------------------------------------------------
+# Start the agent now
+# ---------------------------------------------------------------------------
+
 Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ''
 Write-Host 'Pocket Agent installation completed.' -ForegroundColor Green
 Write-Host "Install directory: $AppDir"
 Write-Host "Scheduled task:    $TaskName"
+Write-Host "Agent log:         $LogFile"
+Write-Host ''
+Write-Host 'The agent runs hidden and starts again at user logon.'
 Write-Host ''
